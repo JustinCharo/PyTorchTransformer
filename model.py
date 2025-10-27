@@ -118,3 +118,50 @@ class MultiHeadAttentionBlock(nn.Module):
 
         return self.w_o(x)
 
+class ResidualConnection(nn.Module)
+
+    def __init__(self, dropout: float) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = LayerNormalization()
+
+    def forward(self, x, sublayer):
+        return x + self.dropout(sublayer(self.norm(x)))
+
+class EncoderBlock(nn.Module):
+    def __init__(self, self_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForward, dropout: float) -> None:
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residual_connection = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
+
+    def forward(self, x, mask):
+        # The three x arguments represent the query, key, and value vectors for the self attention block
+        x = self.residual_connection[0](x, lambda x: self.self_attention_block(x, x, x, mask)) # lambda function applies the self attention block to the input x
+        x = self.residual_connection[1](x, self.feed_forward_block)
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, layers: nn.ModuleList, norm: LayerNormalization) -> None:
+        super().__init__()
+        self.layers = layers
+        self.norm = LayerNormalization()
+
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+class DecoderBlock(nn.Module):
+    def __init__(self, self_attention_block: MultiHeadAttentionBlock, cross_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForward, dropout: float) -> None:
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.cross_attention_block = cross_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residual_connection = nn.ModuleList([ResidualConnection(dropout) for _ in range(3)])
+
+    def forward(self, x, encoder_output, src_mask, tgt_mask): # source language: english, # target language: italian
+        x = self.residual_connection[0](x, lambda x: self.self_attention_block(x, x, x, tgt_mask)) # three x arguments represent the query, key, and value vectors for the self attention block
+        x = self.residual_connection[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
+        x = self.residual_connection[2](x, self.feed_forward_block)
+        return x
