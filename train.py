@@ -8,11 +8,11 @@ import torchmetrics
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
 
 import warnings
 from tqdm import tqdm
 import os
+import math
 from pathlib import Path
 
 from datasets import load_dataset
@@ -40,8 +40,8 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
         out = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
 
         # get next token
-        logits = model.project(out[:, -1])
-        _, next_word = torch.max(logits, dim=1)
+        prob = model.project(out[:, -1])
+        _, next_word = torch.max(prob, dim=1)
         decoder_input = torch.cat(
             [decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1
         )
@@ -58,47 +58,80 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     source_texts = []
     expected = []
     predicted = []
+    validation_losses = []
 
     try:
         # get the console window width
-        with os.popen('stty size', 'r') as console:
-            _, console_width = console.read().split()
-            console_width = int(console_width)
+        if os.name == 'nt':  # Windows
+            import shutil
+            console_width = shutil.get_terminal_size().columns
+        else:  # Unix/Linux/Mac
+            with os.popen('stty size', 'r') as console:
+                _, console_width = console.read().split()
+                console_width = int(console_width)
     except:
         # If we can't get the console width, use 80 as default
         console_width = 80
+
+    # Loss function for validation (same as training)
+    pad_token_id = tokenizer_tgt.token_to_id('[PAD]')
+    loss_fn = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=0.1).to(device)
 
     with torch.no_grad():
         for batch in validation_ds:
             count += 1
             encoder_input = batch["encoder_input"].to(device) # (b, seq_len)
             encoder_mask = batch["encoder_mask"].to(device) # (b, 1, 1, seq_len)
+            decoder_input = batch["decoder_input"].to(device) # (B, seq_len)
+            decoder_mask = batch["decoder_mask"].to(device) # (B, 1, seq_len, seq_len)
+            label = batch["label"].to(device) # (B, seq_len)
 
             # check that the batch size is 1
             assert encoder_input.size(
                 0) == 1, "Batch size must be 1 for validation"
 
+            # Compute validation loss
+            encoder_output = model.encode(encoder_input, encoder_mask)
+            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+            proj_output = model.project(decoder_output)
+            loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+            validation_losses.append(loss.item())
+
+            # Generate translation
             model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
 
             source_text = batch["src_text"][0]
             target_text = batch["tgt_text"][0]
-            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
+            
+            # Decode and clean up special tokens for BLEU calculation
+            model_out_ids = model_out.detach().cpu().numpy().tolist()
+            # Remove SOS, EOS, and PAD tokens for cleaner text
+            sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+            eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+            pad_idx = tokenizer_tgt.token_to_id('[PAD]')
+            model_out_ids = [id for id in model_out_ids if id not in [sos_idx, eos_idx, pad_idx]]
+            
+            model_out_text = tokenizer_tgt.decode(model_out_ids)
 
             source_texts.append(source_text)
             expected.append(target_text)
             predicted.append(model_out_text)
             
-            # Print the source, target and model output
-            print_msg('-'*console_width)
-            print_msg(f"{f'SOURCE: ':>12}{source_text}")
-            print_msg(f"{f'TARGET: ':>12}{target_text}")
-            print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
-
-            if count == num_examples:
+            # Print the source, target and model output (only for first few examples)
+            if count <= num_examples:
                 print_msg('-'*console_width)
-                break
+                print_msg(f"{f'SOURCE: ':>12}{source_text}")
+                print_msg(f"{f'TARGET: ':>12}{target_text}")
+                print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
+                if count == num_examples:
+                    print_msg('-'*console_width)
     
-    if writer:
+    if writer and len(predicted) > 0:
+        # Log validation loss
+        avg_val_loss = sum(validation_losses) / len(validation_losses)
+        writer.add_scalar('validation loss', avg_val_loss, global_step)
+        writer.flush()
+
         # Evaluate the character error rate
         # Compute the char error rate 
         metric = torchmetrics.CharErrorRate()
@@ -114,9 +147,15 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
 
         # Compute the BLEU metric
         metric = torchmetrics.BLEUScore()
-        bleu = metric(predicted, expected)
+        # Format references as list of lists (each reference is a list)
+        target_formatted = [[ref] for ref in expected]
+        bleu = metric(predicted, target_formatted)
         writer.add_scalar('validation BLEU', bleu, global_step)
         writer.flush()
+        
+        return avg_val_loss, cer, wer, bleu
+    
+    return None, None, None, None
 
 def get_or_build_tokenizer(config, ds, lang):
     # Path to the tokenizer file, i.e. '../tokenizers/tokenizer_{0}.json'
@@ -165,25 +204,9 @@ def get_ds(config):
     print(f'Max length of target sentence: {max_len_tgt}')
     
 
-    # Optimize DataLoader with num_workers, pin_memory for faster data loading
-    num_workers = min(4, os.cpu_count() or 1)  # Use up to 4 workers, or CPU count if less
-    train_dataloader = DataLoader(
-        train_ds, 
-        batch_size=config['batch_size'], 
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,  # Faster GPU transfer
-        # persistent_workers: Keeps worker processes alive between epochs (saves process startup time)
-        # NOTE: This does NOT keep training running after program closes - it's just a performance optimization
-        persistent_workers=True if num_workers > 0 else False
-    )
-    val_dataloader = DataLoader(
-        val_ds, 
-        batch_size=1, 
-        shuffle=True,
-        num_workers=0,  # Keep validation simple
-        pin_memory=True
-    )
+    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
+    # CRITICAL FIX: Don't shuffle validation set for consistent metrics across epochs
+    val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=False)
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
     
@@ -211,22 +234,24 @@ def train_model(config):
 
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
-    
-    # Compile model for faster training (PyTorch 2.0+)
-    if hasattr(torch, 'compile'):
-        print("Compiling model for faster training...")
-        model = torch.compile(model, mode='reduce-overhead')
-    
     # Tensorboard
     writer = SummaryWriter(config['experiment_name'])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
     
-    # Mixed precision training scaler (for faster GPU training)
-    use_amp = device.type == 'cuda'  # Use AMP on CUDA devices
-    scaler = GradScaler() if use_amp else None
-    if use_amp:
-        print("Using mixed precision training (AMP) for faster training")
+    # Add learning rate scheduler for better convergence
+    # Warmup for first 10% of steps, then cosine decay
+    def lr_lambda(step):
+        warmup_steps = config.get('warmup_steps', config['num_epochs'] * len(train_dataloader) * 0.1)
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            # Cosine decay
+            total_steps = config['num_epochs'] * len(train_dataloader)
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = LambdaLR(optimizer, lr_lambda)
 
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
@@ -240,66 +265,61 @@ def train_model(config):
         initial_epoch = state['epoch'] + 1
         optimizer.load_state_dict(state['optimizer_state_dict'])
         global_step = state['global_step']
+        if 'scheduler_state_dict' in state:
+            scheduler.load_state_dict(state['scheduler_state_dict'])
     else:
         print('No model to preload, starting from scratch')
 
-    # Fix: use tokenizer_tgt for PAD token (not tokenizer_src)
-    pad_token_id = tokenizer_tgt.token_to_id('[PAD]')
-    loss_fn = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=0.1).to(device)
-    
-    # Gradient accumulation config (optional, for larger effective batch size)
-    grad_accum_steps = config.get('grad_accum_steps', 1)
+    # CRITICAL FIX: Use tokenizer_tgt for PAD token since loss is computed on target tokens
+    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_tgt.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
 
     for epoch in range(initial_epoch, config['num_epochs']):
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         model.train()
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
-        
-        optimizer.zero_grad(set_to_none=True)  # Zero gradients at start of epoch
-        
-        for batch_idx, batch in enumerate(batch_iterator):
-            encoder_input = batch['encoder_input'].to(device, non_blocking=True) # (b, seq_len)
-            decoder_input = batch['decoder_input'].to(device, non_blocking=True) # (B, seq_len)
-            encoder_mask = batch['encoder_mask'].to(device, non_blocking=True) # (B, 1, 1, seq_len)
-            decoder_mask = batch['decoder_mask'].to(device, non_blocking=True) # (B, 1, seq_len, seq_len)
-            label = batch['label'].to(device, non_blocking=True) # (B, seq_len)
+        for batch in batch_iterator:
 
-            # Mixed precision training context
-            with autocast(enabled=use_amp):
-                # Run the tensors through the encoder, decoder and the projection layer
-                encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
-                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
-                proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
+            encoder_input = batch['encoder_input'].to(device) # (b, seq_len)
+            decoder_input = batch['decoder_input'].to(device) # (B, seq_len)
+            encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
+            decoder_mask = batch['decoder_mask'].to(device) # (B, 1, seq_len, seq_len)
 
-                # Compute the loss using cross entropy
-                loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
-                loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
+            # Run the tensors through the encoder, decoder and the projection layer
+            encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
+            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
+            proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
 
-            batch_iterator.set_postfix({"loss": f"{loss.item() * grad_accum_steps:6.3f}"})
+            # Compare the output with the label
+            label = batch['label'].to(device) # (B, seq_len)
 
-            # Backpropagate the loss (with mixed precision if enabled)
-            if use_amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            # Compute the loss using a simple cross entropy
+            loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
 
-            # Update weights every grad_accum_steps batches
-            if (batch_idx + 1) % grad_accum_steps == 0:
-                if use_amp:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            # Log the loss every batch (unscaled for display)
-            writer.add_scalar('train loss', loss.item() * grad_accum_steps, global_step)
+            # Log the loss
+            writer.add_scalar('train loss', loss.item(), global_step)
             writer.flush()
+
+            # Backpropagate the loss
+            loss.backward()
+
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Update the weights
+            optimizer.step()
+            scheduler.step()  # Update learning rate
+            optimizer.zero_grad(set_to_none=True)
+
             global_step += 1
 
         # Run validation at the end of every epoch
-        run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        # Use more validation examples for better metrics (default 50, but can be configured)
+        num_val_examples = config.get('num_val_examples', 50)
+        val_loss, cer, wer, bleu = run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer, num_examples=min(num_val_examples, len(val_dataloader)))
+        
+        if val_loss is not None:
+            batch_iterator.write(f"Epoch {epoch:02d} - Val Loss: {val_loss:.4f}, CER: {cer:.2f}%, WER: {wer:.2f}%, BLEU: {bleu:.4f}")
 
         # Save the model at the end of every epoch
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
@@ -307,6 +327,7 @@ def train_model(config):
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             'global_step': global_step
         }, model_filename)
 
