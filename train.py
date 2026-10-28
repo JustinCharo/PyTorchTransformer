@@ -137,6 +137,7 @@ def get_or_build_tokenizer(config, ds, lang):
     # Path to the tokenizer file, i.e. '../tokenizers/tokenizer_{0}.json'
     tokenizer_path = Path(config['tokenizer_file'].format(lang))
     if not Path.exists(tokenizer_path):
+        tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
         tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()
         trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
@@ -150,31 +151,37 @@ def get_all_sentences(ds, lang):
     for item in ds:
         yield item['translation'][lang]
 
+def filter_long_pairs(ds, tokenizer_src, tokenizer_tgt, config):
+    keep = []
+    batch_size = 1024
+    for start in range(0, len(ds), batch_size):
+        pairs = [ds[i]['translation'] for i in range(start, min(start + batch_size, len(ds)))]
+        src_lengths = [len(item.ids) for item in tokenizer_src.encode_batch([pair[config['lang_src']] for pair in pairs])]
+        tgt_lengths = [len(item.ids) for item in tokenizer_tgt.encode_batch([pair[config['lang_tgt']] for pair in pairs])]
+        keep.extend(start + i for i, (src_len, tgt_len) in enumerate(zip(src_lengths, tgt_lengths))
+                    if src_len + 2 <= config['seq_len'] and tgt_len + 1 <= config['seq_len'])
+    if len(keep) != len(ds):
+        print(f'Dropped {len(ds) - len(keep)} sentence pairs longer than seq_len={config["seq_len"]}')
+    return Subset(ds, keep)
+
 def get_ds(config):
     ds_raw = load_dataset(f"{config['datasource']}", f"{config['lang_src']}-{config['lang_tgt']}", split='train')
 
-    # Build tokenizers
-    tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
-    tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config['lang_tgt'])
-
-    # Find the length of each sentence in the source and target language (batched, so it's fast)
-    pairs = ds_raw['translation']
-    src_lens = [len(e.ids) for e in tokenizer_src.encode_batch([p[config['lang_src']] for p in pairs])]
-    tgt_lens = [len(e.ids) for e in tokenizer_tgt.encode_batch([p[config['lang_tgt']] for p in pairs])]
-    print(f'Max length of source sentence: {max(src_lens)}')
-    print(f'Max length of target sentence: {max(tgt_lens)}')
-
-    # Drop pairs that don't fit in seq_len (source gets <s> and </s>, target gets one of them) instead of crashing mid-epoch
-    keep = [i for i, (s, t) in enumerate(zip(src_lens, tgt_lens)) if s + 2 <= config['seq_len'] and t + 1 <= config['seq_len']]
-    if len(keep) < len(ds_raw):
-        print(f'Dropped {len(ds_raw) - len(keep)} sentence pairs longer than seq_len={config["seq_len"]}')
-    ds_raw = Subset(ds_raw, keep)
-
     # Keep 90% for training, 10% for validation
-    # The split is seeded so a resumed run validates on the same sentences it never trained on
+    # Split before fitting tokenizers so validation sentences do not affect the vocabulary.
     train_ds_size = int(0.9 * len(ds_raw))
     val_ds_size = len(ds_raw) - train_ds_size
+    if train_ds_size == 0 or val_ds_size == 0:
+        raise ValueError('The dataset needs at least two sentence pairs')
     train_ds_raw, val_ds_raw = random_split(ds_raw, [train_ds_size, val_ds_size], generator=torch.Generator().manual_seed(config['seed']))
+
+    tokenizer_src = get_or_build_tokenizer(config, train_ds_raw, config['lang_src'])
+    tokenizer_tgt = get_or_build_tokenizer(config, train_ds_raw, config['lang_tgt'])
+
+    train_ds_raw = filter_long_pairs(train_ds_raw, tokenizer_src, tokenizer_tgt, config)
+    val_ds_raw = filter_long_pairs(val_ds_raw, tokenizer_src, tokenizer_tgt, config)
+    if not train_ds_raw or not val_ds_raw:
+        raise ValueError('No sentence pairs remain in the training or validation split; increase seq_len')
 
     train_ds = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
     val_ds = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
@@ -186,7 +193,8 @@ def get_ds(config):
         pin_memory=torch.cuda.is_available(),
         persistent_workers=config['num_workers'] > 0,
     )
-    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, drop_last=True, **loader_kwargs)
+    train_generator = torch.Generator().manual_seed(config['seed'])
+    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, generator=train_generator, **loader_kwargs)
     # Don't shuffle validation set for consistent metrics across epochs
     val_dataloader = DataLoader(val_ds, batch_size=config['val_batch_size'], shuffle=False, **loader_kwargs)
 
@@ -260,6 +268,12 @@ def train_model(config):
             scheduler.load_state_dict(state['scheduler_state_dict'])
         if 'scaler_state_dict' in state:
             scaler.load_state_dict(state['scaler_state_dict'])
+        if 'train_generator_state' in state:
+            train_dataloader.generator.set_state(state['train_generator_state'])
+        if 'torch_rng_state' in state:
+            torch.set_rng_state(state['torch_rng_state'].cpu())
+        if device.type == 'cuda' and 'cuda_rng_state' in state:
+            torch.cuda.set_rng_state_all(state['cuda_rng_state'])
     else:
         print('No model to preload, starting from scratch')
 
@@ -297,9 +311,13 @@ def train_model(config):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             # Update the weights
+            scale_before_step = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()  # Update learning rate
+            # GradScaler skips the optimizer update when fp16 gradients overflow.
+            if scaler.get_scale() >= scale_before_step:
+                scheduler.step()
+                global_step += 1
             optimizer.zero_grad(set_to_none=True)
 
             # Log the loss (only every log_every steps, since .item() waits for the GPU)
@@ -308,8 +326,6 @@ def train_model(config):
                 batch_iterator.set_postfix({"loss": f"{loss_value:6.3f}"})
                 writer.add_scalar('train loss', loss_value, global_step)
                 writer.add_scalar('learning rate', scheduler.get_last_lr()[0], global_step)
-
-            global_step += 1
 
         # Run validation at the end of every epoch
         val_loss, cer, wer, bleu = run_validation(model, val_dataloader, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer, val_loss_fn, autocast, num_examples=config['num_val_examples'], num_print_examples=config['num_print_examples'])
@@ -325,7 +341,10 @@ def train_model(config):
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
-            'global_step': global_step
+            'global_step': global_step,
+            'train_generator_state': train_dataloader.generator.get_state(),
+            'torch_rng_state': torch.get_rng_state(),
+            'cuda_rng_state': torch.cuda.get_rng_state_all() if device.type == 'cuda' else None,
         }, model_filename)
 
     writer.close()

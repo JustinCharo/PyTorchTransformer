@@ -1,0 +1,6 @@
+torch>=2.2
+datasets
+tokenizers
+torchmetrics
+tensorboard
+tqdm

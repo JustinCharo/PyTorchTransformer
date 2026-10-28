@@ -218,6 +218,14 @@ class Transformer(nn.Module):
         return self.project(decoder_output)
 
 def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
+    if d_model <= 0 or d_model % 2:
+        raise ValueError('d_model must be a positive even number for sinusoidal positional encoding')
+    if h <= 0 or d_model % h:
+        raise ValueError('h must be positive and divide d_model')
+    if src_seq_len <= 0 or tgt_seq_len <= 0:
+        raise ValueError('Sequence lengths must be positive')
+    if N <= 0 or d_ff <= 0:
+        raise ValueError('N and d_ff must be positive')
     # Create embedding layers
     src_embed = InputEmbeddings(d_model, src_vocab_size)
     tgt_embed = InputEmbeddings(d_model, tgt_vocab_size)
