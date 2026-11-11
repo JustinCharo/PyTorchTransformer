@@ -5,10 +5,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.trainers import WordLevelTrainer
 
 from dataset import Collator
 from model import build_transformer
-from train import get_ds, run_validation
+from train import get_ds, get_param_groups, prune_checkpoints, run_validation, split_like_tokenizer
+from translate import translate
 
 
 class TrainingTests(unittest.TestCase):
@@ -73,6 +78,46 @@ class TrainingTests(unittest.TestCase):
             metrics = run_validation(model, val_loader, tokenizer_tgt, 8, torch.device('cpu'),
                                      lambda message: None, 0, None, loss_fn, nullcontext(), num_examples=2)
             self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in metrics))
+
+
+    def test_references_split_like_predictions(self):
+        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = Whitespace()
+        self.assertEqual(split_like_tokenizer(tokenizer, 'Ciao, mondo!'), 'Ciao , mondo !')
+
+    def test_no_weight_decay_on_biases_norms_or_embeddings(self):
+        model = build_transformer(16, 16, 8, 8, d_model=16, N=1, h=4, dropout=0, d_ff=32)
+        decay, no_decay = get_param_groups(model, 0.01)
+        decay_ids = {id(p) for p in decay['params']}
+        self.assertNotIn(id(model.tgt_embed.embedding.weight), decay_ids)
+        self.assertNotIn(id(model.encoder.norm.alpha), decay_ids)
+        self.assertIn(id(model.encoder.layers[0].feed_forward_block.linear_1.weight), decay_ids)
+        self.assertEqual(len(decay['params']) + len(no_decay['params']), len(list(model.parameters())))
+
+    def test_prune_keeps_newest_checkpoints(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = {'datasource': str(Path(folder) / 'src'), 'model_folder': 'weights',
+                      'model_basename': 'tmodel_', 'keep_last': 2}
+            weights = Path(f"{config['datasource']}_{config['model_folder']}")
+            weights.mkdir()
+            for epoch in ['08', '09', '10', '100']:
+                (weights / f'tmodel_{epoch}.pt').touch()
+            prune_checkpoints(config)
+            self.assertEqual(sorted(p.name for p in weights.iterdir()), ['tmodel_10.pt', 'tmodel_100.pt'])
+
+    def test_translate_returns_one_output_per_sentence(self):
+        sentences = ['hello world', 'a longer sentence than the first one']
+        tokenizers = []
+        for _ in range(2):
+            tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
+            tokenizer.pre_tokenizer = Whitespace()
+            tokenizer.train_from_iterator(sentences, trainer=WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"]))
+            tokenizers.append(tokenizer)
+        model = build_transformer(tokenizers[0].get_vocab_size(), tokenizers[1].get_vocab_size(),
+                                  6, 6, d_model=16, N=1, h=4, dropout=0, d_ff=32).eval()
+        outputs = translate(sentences, model, tokenizers[0], tokenizers[1], 6, torch.device('cpu'))
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(isinstance(text, str) for text in outputs))
 
 
 if __name__ == '__main__':

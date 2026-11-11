@@ -17,6 +17,7 @@ def get_config():
         "model_folder": "weights",
         "model_basename": "tmodel_",
         "preload": "latest",
+        "keep_last": 3, # number of epoch checkpoints to keep on disk (None keeps all of them)
         "tokenizer_file": "tokenizer_{0}.json",
         "experiment_name": "runs/tmodel",
         "seed": 42, # keeps the train/validation split identical across runs and resumes

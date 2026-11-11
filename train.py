@@ -1,4 +1,4 @@
-from model import build_transformer
+from model import build_transformer, LayerNormalization
 from dataset import BilingualDataset, Collator, causal_mask
 from config import get_config, get_weights_file_path, latest_weights_file_path
 
@@ -61,6 +61,10 @@ def strip_special_tokens(ids, sos_idx, eos_idx, pad_idx):
             out.append(id)
     return out
 
+def split_like_tokenizer(tokenizer, text):
+    # Space out punctuation the same way the tokenizer does, so references line up with decoded predictions
+    return " ".join(word for word, _ in tokenizer.pre_tokenizer.pre_tokenize_str(text))
+
 def run_validation(model, validation_ds, tokenizer_tgt, max_len, device, print_msg, global_step, writer, loss_fn, autocast, num_examples=500, num_print_examples=2):
     model.eval()
 
@@ -98,7 +102,7 @@ def run_validation(model, validation_ds, tokenizer_tgt, max_len, device, print_m
                     if len(predicted) >= num_examples:
                         break
                     predicted.append(tokenizer_tgt.decode(strip_special_tokens(ids, sos_idx, eos_idx, pad_idx)))
-                    expected.append(batch["tgt_text"][i])
+                    expected.append(split_like_tokenizer(tokenizer_tgt, batch["tgt_text"][i]))
 
                     # Print the source, target and model output (only for first few examples)
                     if len(predicted) <= num_print_examples:
@@ -204,6 +208,36 @@ def get_model(config, vocab_src_len, vocab_tgt_len):
     model = build_transformer(vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'], d_model=config['d_model'], dropout=config['dropout'])
     return model
 
+def get_param_groups(model, weight_decay):
+    # Weight decay only on the weight matrices; biases, norm parameters and embeddings are left alone
+    decay, no_decay = [], []
+    no_decay_ids = set()
+    for module in model.modules():
+        if isinstance(module, (nn.Embedding, LayerNormalization)):
+            no_decay_ids.update(id(p) for p in module.parameters(recurse=False))
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.dim() < 2 or id(p) in no_decay_ids:
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+def prune_checkpoints(config):
+    # Delete all but the newest keep_last checkpoints (each one holds the optimizer state too, so they add up fast)
+    keep_last = config.get('keep_last')
+    if not keep_last:
+        return
+    model_folder = Path(f"{config['datasource']}_{config['model_folder']}")
+    files = sorted(model_folder.glob(f"{config['model_basename']}*.pt"),
+                   key=lambda p: int(p.stem[len(config['model_basename']):]))
+    for old in files[:-keep_last]:
+        old.unlink()
+
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -239,7 +273,7 @@ def train_model(config):
     writer = SummaryWriter(config['experiment_name'])
 
     # Betas from the original paper; fused kernel on CUDA
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['lr'], betas=(0.9, 0.98), eps=1e-9, weight_decay=config['weight_decay'], fused=device.type == 'cuda')
+    optimizer = torch.optim.AdamW(get_param_groups(model, config['weight_decay']), lr=config['lr'], betas=(0.9, 0.98), eps=1e-9, fused=device.type == 'cuda')
 
     # Learning rate scheduler: linear warmup for the first warmup_frac of steps, then cosine decay
     total_steps = config['num_epochs'] * len(train_dataloader)
@@ -315,13 +349,15 @@ def train_model(config):
             scaler.step(optimizer)
             scaler.update()
             # GradScaler skips the optimizer update when fp16 gradients overflow.
-            if scaler.get_scale() >= scale_before_step:
+            stepped = scaler.get_scale() >= scale_before_step
+            if stepped:
                 scheduler.step()
                 global_step += 1
             optimizer.zero_grad(set_to_none=True)
 
             # Log the loss (only every log_every steps, since .item() waits for the GPU)
-            if global_step % config['log_every'] == 0:
+            # Skipped steps don't advance global_step, so only log after a real update to avoid duplicate points
+            if stepped and global_step % config['log_every'] == 0:
                 loss_value = loss.item()
                 batch_iterator.set_postfix({"loss": f"{loss_value:6.3f}"})
                 writer.add_scalar('train loss', loss_value, global_step)
@@ -346,6 +382,7 @@ def train_model(config):
             'torch_rng_state': torch.get_rng_state(),
             'cuda_rng_state': torch.cuda.get_rng_state_all() if device.type == 'cuda' else None,
         }, model_filename)
+        prune_checkpoints(config)
 
     writer.close()
 
